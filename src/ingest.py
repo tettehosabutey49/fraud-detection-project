@@ -12,13 +12,23 @@ What this script does:
 Run from the project root:
     uv run python src/ingest.py
 """
+"""
+Step 1: Ingest the PaySim dataset into Delta Lake.
 
-import os
-import sys
+What this script does:
+  1. Reads the raw PaySim CSV with an explicit schema
+  2. Keeps only TRANSFER and CASH_OUT transactions (the only types with fraud)
+  3. Drops the balance columns that leak the fraud label
+  4. Runs basic data quality checks
+  5. Saves the result as a Delta table at data/delta/transactions
+  6. Prints a short summary of the saved data
+
+Run from the project root:
+    uv run python src/ingest.py
+"""
+
 from pathlib import Path
-
-from delta import configure_spark_with_delta_pip
-from pyspark.sql import DataFrame, SparkSession
+from pyspark.sql import DataFrame
 from pyspark.sql import functions as F
 from pyspark.sql.types import (
     DoubleType,
@@ -28,16 +38,13 @@ from pyspark.sql.types import (
     StructType,
 )
 
+from spark_utils import DELTA_DIR, PROJECT_ROOT, build_spark
+
 # ---------------------------------------------------------------------------
 # Paths and settings
 # ---------------------------------------------------------------------------
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 RAW_DIR = PROJECT_ROOT / "data" / "raw"
-DELTA_PATH = PROJECT_ROOT / "data" / "delta" / "transactions"
-
-# On Windows, Spark needs winutils.exe and hadoop.dll to write files.
-# Put them in C:\hadoop\bin, or set HADOOP_HOME to another folder.
-WINDOWS_HADOOP_HOME = Path(os.environ.get("HADOOP_HOME", r"C:\hadoop"))
+DELTA_PATH = DELTA_DIR / "transactions"
 
 # Fraud only occurs in these transaction types
 FRAUD_TYPES = ["TRANSFER", "CASH_OUT"]
@@ -72,49 +79,6 @@ PAYSIM_SCHEMA = StructType(
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-def configure_windows() -> None:
-    """Point Spark at winutils on Windows. Does nothing on macOS/Linux."""
-    if os.name != "nt":
-        return
-
-    winutils = WINDOWS_HADOOP_HOME / "bin" / "winutils.exe"
-    if not winutils.exists():
-        raise FileNotFoundError(
-            f"winutils.exe not found at {winutils}.\n"
-            "Download winutils.exe and hadoop.dll into that folder "
-            "(see the Windows setup notes in the README)."
-        )
-
-    os.environ["HADOOP_HOME"] = str(WINDOWS_HADOOP_HOME)
-    os.environ["PATH"] = (
-        str(WINDOWS_HADOOP_HOME / "bin") + os.pathsep + os.environ.get("PATH", "")
-    )
-
-
-def build_spark() -> SparkSession:
-    """Create a local Spark session with Delta Lake enabled."""
-    configure_windows()
-
-    # Make Spark workers use this project's Python (avoids errors on Windows)
-    os.environ["PYSPARK_PYTHON"] = sys.executable
-    os.environ["PYSPARK_DRIVER_PYTHON"] = sys.executable
-
-    builder = (
-        SparkSession.builder.appName("paysim-ingest")
-        .master("local[*]")
-        .config("spark.driver.memory", "4g")
-        .config("spark.sql.session.timeZone", "UTC")
-        .config("spark.sql.extensions", "io.delta.sql.DeltaSparkSessionExtension")
-        .config(
-            "spark.sql.catalog.spark_catalog",
-            "org.apache.spark.sql.delta.catalog.DeltaCatalog",
-        )
-    )
-    spark = configure_spark_with_delta_pip(builder).getOrCreate()
-    spark.sparkContext.setLogLevel("WARN")
-    return spark
-
-
 def find_raw_csv() -> Path:
     """Find the PaySim CSV in data/raw."""
     files = sorted(RAW_DIR.glob("*.csv"))
@@ -189,7 +153,7 @@ def print_summary(df: DataFrame) -> None:
 # Main
 # ---------------------------------------------------------------------------
 def main() -> None:
-    spark = build_spark()
+    spark = build_spark("paysim-ingest")
 
     csv_path = find_raw_csv()
     print(f"Reading {csv_path.name} ...")

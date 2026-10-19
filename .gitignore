@@ -23,3 +23,11 @@ mlruns/
 
 # Environment secrets
 .env
+
+mlflow.db
+mlruns/
+models/
+
+reports
+fraud-detection-technical-report.docx
+fraud-detection-technical-report.pdf
