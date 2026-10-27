@@ -2,7 +2,7 @@
 
 An end-to-end fraud detection system that scores financial transactions in real time using behavioral deep learning models. Built entirely with free, open-source tools.
 
-> **Status:** 🚧 In progress. Steps 1 and 2 are complete. In Step 3, the XGBoost baseline catches 44% of test-set fraud with 46% precision (PR-AUC 0.44, 45x better than random).
+> **Status:** 🚧 In progress. Steps 1 and 2 are complete. In Step 3, a Transformer sequence model leads: it catches 42% of test-set fraud with 70% precision (PR-AUC 0.55, range 0.53–0.56 over 3 seeds), ahead of the XGBoost baseline (PR-AUC 0.44, 46% precision).
 
 ---
 
@@ -147,6 +147,7 @@ uvx kaggle datasets download -d ealaxi/paysim1 -p data/raw --unzip
 uv run python src/ingest.py     # Step 1: clean data -> data/delta/transactions
 uv run python src/features.py   # Step 2: features   -> data/delta/features
 uv run python src/train.py      # Step 3: models     -> models/, reports/, MLflow
+uv run python src/train_transformer.py   # Step 3: Transformer sequence model
 ```
 
 To browse model runs in MLflow:
@@ -269,7 +270,50 @@ All rows kept and no missing feature values.
 - **The alert threshold does not transfer perfectly** from validation (0.14% fraud) to test (0.98% fraud). In production, the threshold would be set by alert capacity and reviewed as fraud rates change.
 - **56% of fraud is still missed.** About a third of fraud goes to receivers with history, which the current features cannot separate from normal payments.
 
-Next in Step 3: the Transformer sequence model and an anomaly detector. With senders appearing once and receivers about 5 times, sequences are short, so the Transformer is treated as an experiment to compare against XGBoost.
+### Transformer sequence model
+
+`src/train_transformer.py` tests whether a model can learn directly from the receiver's transaction history instead of from hand-made summary features.
+
+- **Input:** a sequence of up to 9 tokens: the current transaction, plus the receiver's 8 most recent transactions from earlier hours (the same no-future rule as Step 2).
+- **Each token:** amount (log scale), transaction type, hour of day as a point on a clock, hours before the current transaction, and how much history the receiver has.
+- **Model:** a small PyTorch Transformer encoder (2 layers, about 27,000 parameters). It reads the answer off the current transaction's token. It runs on a laptop CPU.
+- **Training:** every fraud case plus a fresh random 20% of normal transactions each epoch, early stopping on validation PR-AUC, and the same threshold and test procedure as XGBoost.
+
+**Results: the Transformer beat XGBoost on the test set, across 3 random seeds**
+
+| Test set (base fraud rate 0.98%) | XGBoost, all features | Transformer (average of 3 seeds) |
+|---|---|---|
+| PR-AUC | 0.439 | **0.547** (range 0.529–0.560) |
+| Lift over random | 44.6x | **55.6x** |
+| ROC-AUC | 0.940 | 0.939 |
+| Alerts raised | 3,862 | **2,389** |
+| Fraud caught | 1,780 / 4,010 (44%) | 1,665 / 4,010 (42%) |
+| Precision | 46.1% | **69.8%** (range 66.4–73.0%) |
+
+Per seed:
+
+| Seed | Test PR-AUC | Precision | Fraud caught | Alerts | Best epoch |
+|---|---|---|---|---|---|
+| 42 | 0.550 | 70.0% | 1,637 | 2,338 | 2 |
+| 7 | 0.560 | 73.0% | 1,691 | 2,316 | 1 |
+| 123 | 0.529 | 66.4% | 1,668 | 2,512 | 4 |
+
+Each epoch takes about 55 seconds on a laptop CPU. Even the weakest seed (0.529) is well above XGBoost (0.439), so the gain is not luck.
+
+**Insights**
+
+- **Far cleaner alerts:** the Transformer catches almost as much fraud with 40% fewer alerts, and 70% of its alerts are real fraud, compared with 46% for XGBoost.
+- **Raw history beats summaries:** XGBoost sees aggregates (counts, averages). The Transformer sees each earlier transaction's amount, type and timing, which carry signal the aggregates lose.
+- **The gain appears in later weeks:** the two models tie on validation (PR-AUC 0.42 each) but the Transformer leads on test, where receivers have built up more history.
+- **This was not the expected result.** With short histories (about 5 transactions per receiver), we expected little gain.
+- **Training is stable but learns fast.** Test PR-AUC varies by only 0.03 across seeds. The best epoch varies (1, 2 and 4) because validation PR-AUC barely changes after the first pass; with only 560 validation fraud cases, the exact stopping point is partly noise.
+
+**Checks**
+
+- [x] Repeat with 3 random seeds (42, 7, 123): confirmed
+- [ ] Run with `USE_HOUR = False` to check it doesn't rely on the simulator's night-time pattern
+
+Next in Step 3: the no-hour check, then an anomaly detector.
 
 ---
 
@@ -287,7 +331,8 @@ fraud-detection-project/
 │   ├── spark_utils.py    # Shared Spark + Delta Lake setup
 │   ├── ingest.py         # Step 1: load, clean, check, save
 │   ├── features.py       # Step 2: behavioral features + time split
-│   └── train.py          # Step 3: baselines + XGBoost, logged to MLflow
+│   ├── train.py          # Step 3: baselines + XGBoost, logged to MLflow
+│   └── train_transformer.py  # Step 3: Transformer sequence model
 ├── models/               # saved models (not committed)
 ├── reports/              # results tables and feature importance
 ├── mlflow.db             # MLflow run history (not committed)
@@ -305,7 +350,7 @@ fraud-detection-project/
 - [x] Download PaySim dataset
 - [x] **Step 1:** Ingest data with PySpark, filter to `TRANSFER` and `CASH_OUT`, drop leaky columns, save to Delta Lake
 - [x] **Step 2:** Build receiver behavior features with PySpark and split the data by time
-- [ ] **Step 3:** Train XGBoost baseline, Transformer model, and anomaly detector; track in MLflow *(XGBoost and baselines built)*
+- [ ] **Step 3:** Train XGBoost baseline, Transformer model, and anomaly detector; track in MLflow *(baselines, XGBoost and Transformer done and confirmed over 3 seeds; no-hour check and anomaly detector next)*
 - [ ] **Step 4:** Serve the model with FastAPI and score streamed transactions from Kafka
 - [ ] **Step 5:** Build a dashboard with SHAP explanations and deploy a public demo
 
